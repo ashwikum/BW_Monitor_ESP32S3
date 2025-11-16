@@ -32,6 +32,7 @@ constexpr float EASING_FACTOR = 0.18f; // smoothing factor for animation
 constexpr uint16_t SCREEN_WIDTH = 240;
 constexpr uint16_t SCREEN_HEIGHT = 240;
 constexpr size_t LVGL_BUFFER_PIXELS = (SCREEN_WIDTH * SCREEN_HEIGHT) / 10;
+constexpr size_t RATE_HISTORY_SAMPLES = 60;
 
 // --- Display state for LVGL ---
 static lv_disp_draw_buf_t s_lvglDrawBuffer;
@@ -41,6 +42,12 @@ static TFT_eSPI s_tft = TFT_eSPI(SCREEN_WIDTH, SCREEN_HEIGHT);
 static bool s_lvglInitialized = false;
 static lv_obj_t *s_downloadLabel = nullptr;
 static lv_obj_t *s_uploadLabel = nullptr;
+static lv_obj_t *s_chart = nullptr;
+static lv_chart_series_t *s_downSeries = nullptr;
+static lv_chart_series_t *s_upSeries = nullptr;
+static float s_downHistory[RATE_HISTORY_SAMPLES];
+static float s_upHistory[RATE_HISTORY_SAMPLES];
+static size_t s_historyCount = 0;
 
 struct RateState
 {
@@ -518,7 +525,91 @@ bool initLvgl()
   return true;
 }
 
-void setRateLabel(lv_obj_t *label, const char *prefix, float bps)
+void resetRateHistory()
+{
+  s_historyCount = 0;
+  for (size_t i = 0; i < RATE_HISTORY_SAMPLES; ++i)
+  {
+    s_downHistory[i] = 0.0f;
+    s_upHistory[i] = 0.0f;
+  }
+  if (s_chart && s_downSeries && s_upSeries)
+  {
+    lv_chart_set_all_value(s_chart, s_downSeries, 0);
+    lv_chart_set_all_value(s_chart, s_upSeries, 0);
+  }
+}
+
+void appendRateHistory(float downloadBps, float uploadBps)
+{
+  if (!s_chart || !s_downSeries || !s_upSeries)
+  {
+    return;
+  }
+
+  s_downHistory[s_historyCount % RATE_HISTORY_SAMPLES] = downloadBps;
+  s_upHistory[s_historyCount % RATE_HISTORY_SAMPLES] = uploadBps;
+  ++s_historyCount;
+
+  const size_t sampleCount = s_historyCount < RATE_HISTORY_SAMPLES ? s_historyCount : RATE_HISTORY_SAMPLES;
+  float maxBps = 0.0f;
+  for (size_t i = 0; i < sampleCount; ++i)
+  {
+    if (s_downHistory[i] > maxBps)
+    {
+      maxBps = s_downHistory[i];
+    }
+    if (s_upHistory[i] > maxBps)
+    {
+      maxBps = s_upHistory[i];
+    }
+  }
+  float maxKbps = maxBps / 1000.0f;
+  if (maxKbps < 50.0f)
+  {
+    maxKbps = 50.0f;
+  }
+  lv_chart_set_range(s_chart, LV_CHART_AXIS_PRIMARY_Y, 0,
+                     static_cast<lv_coord_t>(ceilf(maxKbps * 1.2f)));
+
+  lv_chart_set_next_value(s_chart, s_downSeries, static_cast<lv_coord_t>(downloadBps / 1000.0f));
+  lv_chart_set_next_value(s_chart, s_upSeries, static_cast<lv_coord_t>(uploadBps / 1000.0f));
+}
+
+void chartAreaFillEvent(lv_event_t *e)
+{
+  lv_obj_draw_part_dsc_t *dsc = lv_event_get_draw_part_dsc(e);
+  if (!dsc || dsc->part != LV_PART_ITEMS || dsc->p1 == nullptr || dsc->p2 == nullptr)
+  {
+    return;
+  }
+
+  lv_obj_t *obj = lv_event_get_target(e);
+
+  lv_draw_mask_line_param_t line_mask_param;
+  lv_draw_mask_line_points_init(&line_mask_param,
+                                dsc->p1->x, dsc->p1->y,
+                                dsc->p2->x, dsc->p2->y,
+                                LV_DRAW_MASK_LINE_SIDE_BOTTOM);
+  int16_t mask_id = lv_draw_mask_add(&line_mask_param, nullptr);
+
+  lv_draw_rect_dsc_t rect_dsc;
+  lv_draw_rect_dsc_init(&rect_dsc);
+  rect_dsc.bg_opa = LV_OPA_50;
+  rect_dsc.bg_color = lv_color_mix(lv_color_hex(0xFFFFFF), dsc->line_dsc->color, 96);
+  rect_dsc.border_opa = LV_OPA_TRANSP;
+
+  lv_area_t area;
+  area.x1 = LV_MIN(dsc->p1->x, dsc->p2->x);
+  area.x2 = LV_MAX(dsc->p1->x, dsc->p2->x);
+  area.y1 = LV_MIN(dsc->p1->y, dsc->p2->y);
+  area.y2 = obj->coords.y2;
+
+  lv_draw_rect(dsc->draw_ctx, &rect_dsc, &area);
+  lv_draw_mask_remove_id(mask_id);
+}
+
+void setRateLabel(lv_obj_t *label, float bps)
 {
   if (!label)
   {
@@ -537,7 +628,7 @@ void setRateLabel(lv_obj_t *label, const char *prefix, float bps)
   }
 
   char text[48];
-  snprintf(text, sizeof(text), "%s: %s %s", prefix, rate.value, unitSuffix);
+  snprintf(text, sizeof(text), "%s %s", rate.value, unitSuffix);
   lv_label_set_text(label, text);
 }
 
@@ -547,8 +638,9 @@ void updateRateLabels(float downloadBps, float uploadBps)
   {
     return;
   }
-  setRateLabel(s_downloadLabel, "Down", downloadBps);
-  setRateLabel(s_uploadLabel, "Up", uploadBps);
+  setRateLabel(s_uploadLabel, uploadBps);
+  setRateLabel(s_downloadLabel, downloadBps);
+  appendRateHistory(downloadBps, uploadBps);
 }
 
 void showNetdataError()
@@ -559,11 +651,11 @@ void showNetdataError()
   }
   if (s_downloadLabel)
   {
-    lv_label_set_text(s_downloadLabel, "Down: error");
+    lv_label_set_text(s_downloadLabel, "error");
   }
   if (s_uploadLabel)
   {
-    lv_label_set_text(s_uploadLabel, "Up: error");
+    lv_label_set_text(s_uploadLabel, "error");
   }
 }
 
@@ -575,13 +667,47 @@ void createRateScreen()
   }
 
   lv_obj_t *screen = lv_scr_act();
-  s_downloadLabel = lv_label_create(screen);
-  lv_label_set_text(s_downloadLabel, "Down: --");
-  lv_obj_align(s_downloadLabel, LV_ALIGN_CENTER, 0, -16);
+  lv_obj_set_style_bg_color(screen, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
 
   s_uploadLabel = lv_label_create(screen);
-  lv_label_set_text(s_uploadLabel, "Up: --");
-  lv_obj_align(s_uploadLabel, LV_ALIGN_CENTER, 0, 16);
+  lv_label_set_text(s_uploadLabel, "--");
+  lv_obj_align(s_uploadLabel, LV_ALIGN_TOP_MID, 0, 10);
+  lv_obj_set_style_text_font(s_uploadLabel, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(s_uploadLabel, lv_color_hex(0xFFB483), 0);
+
+  s_downloadLabel = lv_label_create(screen);
+  lv_label_set_text(s_downloadLabel, "--");
+  lv_obj_align(s_downloadLabel, LV_ALIGN_TOP_MID, 0, 42);
+  lv_obj_set_style_text_font(s_downloadLabel, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(s_downloadLabel, lv_color_hex(0x7BC6FF), 0);
+
+  s_chart = lv_chart_create(screen);
+  lv_obj_set_size(s_chart, 280, 150);
+  lv_obj_align(s_chart, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_chart_set_type(s_chart, LV_CHART_TYPE_LINE);
+  lv_chart_set_point_count(s_chart, RATE_HISTORY_SAMPLES);
+  lv_chart_set_update_mode(s_chart, LV_CHART_UPDATE_MODE_SHIFT);
+  lv_chart_set_div_line_count(s_chart, 0, 0);
+  lv_chart_set_range(s_chart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
+  lv_obj_set_style_bg_opa(s_chart, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(s_chart, 0, 0);
+  lv_obj_set_style_pad_all(s_chart, 0, 0);
+  lv_obj_set_style_radius(s_chart, 0, 0);
+  lv_obj_add_flag(s_chart, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+  lv_chart_set_axis_tick(s_chart, LV_CHART_AXIS_PRIMARY_X, 0, 0, 0, 0, true, 0);
+  lv_chart_set_axis_tick(s_chart, LV_CHART_AXIS_PRIMARY_Y, 0, 0, 0, 0, true, 0);
+  lv_obj_set_style_line_width(s_chart, 2, LV_PART_ITEMS);
+  lv_obj_set_style_line_rounded(s_chart, true, LV_PART_ITEMS);
+  lv_obj_set_style_size(s_chart, 0, LV_PART_INDICATOR);
+  lv_obj_add_event_cb(s_chart, chartAreaFillEvent, LV_EVENT_DRAW_PART_BEGIN, nullptr);
+
+  s_downSeries = lv_chart_add_series(s_chart, lv_color_hex(0x7BC6FF), LV_CHART_AXIS_PRIMARY_Y);
+  s_upSeries = lv_chart_add_series(s_chart, lv_color_hex(0xFFB483), LV_CHART_AXIS_PRIMARY_Y);
+  lv_chart_set_all_value(s_chart, s_downSeries, 0);
+  lv_chart_set_all_value(s_chart, s_upSeries, 0);
+
+  resetRateHistory();
 }
 
 // --- Setup & loop -----------------------------------------------------------
