@@ -27,12 +27,14 @@ constexpr size_t NETDATA_JSON_CAPACITY = 4096;
 
 // --- Gauge behaviour ---
 constexpr float EASING_FACTOR = 0.18f; // smoothing factor for animation
+constexpr float GAUGE_MAX_MBPS = 1000.0f;
+constexpr int GAUGE_TICK_COUNT = 60;
+constexpr float NEEDLE_SMOOTHING = 0.1f;
 
 // --- LVGL display configuration ---
 constexpr uint16_t SCREEN_WIDTH = 240;
 constexpr uint16_t SCREEN_HEIGHT = 240;
 constexpr size_t LVGL_BUFFER_PIXELS = (SCREEN_WIDTH * SCREEN_HEIGHT) / 10;
-constexpr size_t RATE_HISTORY_SAMPLES = 60;
 
 // --- Display state for LVGL ---
 static lv_disp_draw_buf_t s_lvglDrawBuffer;
@@ -41,13 +43,13 @@ static lv_color_t *s_lvglPrimaryBuffer = nullptr;
 static TFT_eSPI s_tft = TFT_eSPI(SCREEN_WIDTH, SCREEN_HEIGHT);
 static bool s_lvglInitialized = false;
 static lv_obj_t *s_downloadLabel = nullptr;
+static lv_obj_t *s_downloadUnitLabel = nullptr;
 static lv_obj_t *s_uploadLabel = nullptr;
-static lv_obj_t *s_chart = nullptr;
-static lv_chart_series_t *s_downSeries = nullptr;
-static lv_chart_series_t *s_upSeries = nullptr;
-static float s_downHistory[RATE_HISTORY_SAMPLES];
-static float s_upHistory[RATE_HISTORY_SAMPLES];
-static size_t s_historyCount = 0;
+static lv_obj_t *s_speedMeter = nullptr;
+static lv_meter_scale_t *s_speedScale = nullptr;
+static lv_meter_indicator_t *s_speedNeedle = nullptr;
+static float s_displayedDownloadMbps = 0.0f;
+static lv_obj_t *s_glowArc = nullptr;
 
 struct RateState
 {
@@ -525,111 +527,42 @@ bool initLvgl()
   return true;
 }
 
-void resetRateHistory()
+void formatMbps(char *buffer, size_t length, float mbps, bool includeUnits)
 {
-  s_historyCount = 0;
-  for (size_t i = 0; i < RATE_HISTORY_SAMPLES; ++i)
-  {
-    s_downHistory[i] = 0.0f;
-    s_upHistory[i] = 0.0f;
-  }
-  if (s_chart && s_downSeries && s_upSeries)
-  {
-    lv_chart_set_all_value(s_chart, s_downSeries, 0);
-    lv_chart_set_all_value(s_chart, s_upSeries, 0);
-  }
-}
-
-void appendRateHistory(float downloadBps, float uploadBps)
-{
-  if (!s_chart || !s_downSeries || !s_upSeries)
+  if (!buffer || length == 0)
   {
     return;
   }
 
-  s_downHistory[s_historyCount % RATE_HISTORY_SAMPLES] = downloadBps;
-  s_upHistory[s_historyCount % RATE_HISTORY_SAMPLES] = uploadBps;
-  ++s_historyCount;
-
-  const size_t sampleCount = s_historyCount < RATE_HISTORY_SAMPLES ? s_historyCount : RATE_HISTORY_SAMPLES;
-  float maxBps = 0.0f;
-  for (size_t i = 0; i < sampleCount; ++i)
+  if (includeUnits)
   {
-    if (s_downHistory[i] > maxBps)
+    if (mbps >= 100.0f)
     {
-      maxBps = s_downHistory[i];
+      snprintf(buffer, length, "%.0f Mbps", mbps);
     }
-    if (s_upHistory[i] > maxBps)
+    else
     {
-      maxBps = s_upHistory[i];
+      snprintf(buffer, length, "%.1f Mbps", mbps);
     }
-  }
-  float maxKbps = maxBps / 1000.0f;
-  if (maxKbps < 50.0f)
-  {
-    maxKbps = 50.0f;
-  }
-  lv_chart_set_range(s_chart, LV_CHART_AXIS_PRIMARY_Y, 0,
-                     static_cast<lv_coord_t>(ceilf(maxKbps * 1.2f)));
-
-  lv_chart_set_next_value(s_chart, s_downSeries, static_cast<lv_coord_t>(downloadBps / 1000.0f));
-  lv_chart_set_next_value(s_chart, s_upSeries, static_cast<lv_coord_t>(uploadBps / 1000.0f));
-}
-
-void chartAreaFillEvent(lv_event_t *e)
-{
-  lv_obj_draw_part_dsc_t *dsc = lv_event_get_draw_part_dsc(e);
-  if (!dsc || dsc->part != LV_PART_ITEMS || dsc->p1 == nullptr || dsc->p2 == nullptr)
-  {
-    return;
-  }
-
-  lv_obj_t *obj = lv_event_get_target(e);
-
-  lv_draw_mask_line_param_t line_mask_param;
-  lv_draw_mask_line_points_init(&line_mask_param,
-                                dsc->p1->x, dsc->p1->y,
-                                dsc->p2->x, dsc->p2->y,
-                                LV_DRAW_MASK_LINE_SIDE_BOTTOM);
-  int16_t mask_id = lv_draw_mask_add(&line_mask_param, nullptr);
-
-  lv_draw_rect_dsc_t rect_dsc;
-  lv_draw_rect_dsc_init(&rect_dsc);
-  rect_dsc.bg_opa = LV_OPA_50;
-  rect_dsc.bg_color = lv_color_mix(lv_color_hex(0xFFFFFF), dsc->line_dsc->color, 96);
-  rect_dsc.border_opa = LV_OPA_TRANSP;
-
-  lv_area_t area;
-  area.x1 = LV_MIN(dsc->p1->x, dsc->p2->x);
-  area.x2 = LV_MAX(dsc->p1->x, dsc->p2->x);
-  area.y1 = LV_MIN(dsc->p1->y, dsc->p2->y);
-  area.y2 = obj->coords.y2;
-
-  lv_draw_rect(dsc->draw_ctx, &rect_dsc, &area);
-  lv_draw_mask_remove_id(mask_id);
-}
-
-void setRateLabel(lv_obj_t *label, float bps)
-{
-  if (!label)
-  {
-    return;
-  }
-
-  FormattedRate rate = formatRateForDisplay(bps);
-  char unitSuffix[8];
-  if (rate.unit == 'b')
-  {
-    strcpy(unitSuffix, "bps");
   }
   else
   {
-    snprintf(unitSuffix, sizeof(unitSuffix), "%cbps", rate.unit);
+    if (mbps >= 100.0f)
+    {
+      snprintf(buffer, length, "%.0f", mbps);
+    }
+    else
+    {
+      snprintf(buffer, length, "%.1f", mbps);
+    }
   }
+}
 
-  char text[48];
-  snprintf(text, sizeof(text), "%s %s", rate.value, unitSuffix);
-  lv_label_set_text(label, text);
+lv_color_t gaugeColorForRatio(float ratio)
+{
+  ratio = clampFloat(ratio, 0.0f, 1.0f);
+  uint8_t mix = static_cast<uint8_t>(ratio * 255.0f);
+  return lv_color_mix(lv_color_hex(0x9dff6f), lv_color_hex(0x23b9ff), mix);
 }
 
 void updateRateLabels(float downloadBps, float uploadBps)
@@ -638,9 +571,45 @@ void updateRateLabels(float downloadBps, float uploadBps)
   {
     return;
   }
-  setRateLabel(s_uploadLabel, uploadBps);
-  setRateLabel(s_downloadLabel, downloadBps);
-  appendRateHistory(downloadBps, uploadBps);
+
+  float targetDownloadMbps = clampFloat(downloadBps / 1000000.0f, 0.0f, GAUGE_MAX_MBPS);
+  float uploadMbps = clampFloat(uploadBps / 1000000.0f, 0.0f, GAUGE_MAX_MBPS);
+
+  if (NEEDLE_SMOOTHING >= 1.0f) {
+    s_displayedDownloadMbps = targetDownloadMbps;
+  } else {
+    s_displayedDownloadMbps += (targetDownloadMbps - s_displayedDownloadMbps) * NEEDLE_SMOOTHING;
+  }
+  float downloadNeedle = s_displayedDownloadMbps;
+
+  if (s_speedMeter && s_speedNeedle)
+  {
+    lv_meter_set_indicator_value(s_speedMeter, s_speedNeedle, static_cast<int32_t>(downloadNeedle));
+  }
+  if (s_glowArc)
+  {
+    lv_arc_set_value(s_glowArc, static_cast<int16_t>(downloadNeedle));
+    lv_color_t col = gaugeColorForRatio(downloadNeedle / GAUGE_MAX_MBPS);
+    lv_obj_set_style_arc_color(s_glowArc, col, LV_PART_INDICATOR);
+  }
+
+  if (s_downloadLabel)
+  {
+    char text[16];
+    formatMbps(text, sizeof(text), targetDownloadMbps, false);
+    lv_label_set_text(s_downloadLabel, text);
+  }
+  if (s_downloadUnitLabel)
+  {
+    lv_label_set_text(s_downloadUnitLabel, "Mbps");
+  }
+
+  if (s_uploadLabel)
+  {
+    char uploadText[24];
+    formatMbps(uploadText, sizeof(uploadText), uploadMbps, true);
+    lv_label_set_text_fmt(s_uploadLabel, LV_SYMBOL_UPLOAD " %s", uploadText);
+  }
 }
 
 void showNetdataError()
@@ -651,12 +620,22 @@ void showNetdataError()
   }
   if (s_downloadLabel)
   {
-    lv_label_set_text(s_downloadLabel, "error");
+    lv_label_set_text(s_downloadLabel, "--");
   }
   if (s_uploadLabel)
   {
-    lv_label_set_text(s_uploadLabel, "error");
+    lv_label_set_text(s_uploadLabel, LV_SYMBOL_UPLOAD " --");
   }
+  if (s_speedMeter && s_speedNeedle)
+  {
+    lv_meter_set_indicator_value(s_speedMeter, s_speedNeedle, 0);
+  }
+  if (s_glowArc)
+  {
+    lv_arc_set_value(s_glowArc, 0);
+    lv_obj_set_style_arc_color(s_glowArc, lv_color_hex(0x23b9ff), LV_PART_INDICATOR);
+  }
+  s_displayedDownloadMbps = 0.0f;
 }
 
 void createRateScreen()
@@ -667,47 +646,73 @@ void createRateScreen()
   }
 
   lv_obj_t *screen = lv_scr_act();
-  lv_obj_set_style_bg_color(screen, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_style_bg_color(screen, lv_color_hex(0x060b15), 0);
+  lv_obj_set_style_bg_grad_color(screen, lv_color_hex(0x0b1224), 0);
+  lv_obj_set_style_bg_grad_dir(screen, LV_GRAD_DIR_VER, 0);
   lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
 
-  s_uploadLabel = lv_label_create(screen);
-  lv_label_set_text(s_uploadLabel, "--");
-  lv_obj_align(s_uploadLabel, LV_ALIGN_TOP_MID, 0, 10);
-  lv_obj_set_style_text_font(s_uploadLabel, &lv_font_montserrat_16, 0);
-  lv_obj_set_style_text_color(s_uploadLabel, lv_color_hex(0xFFB483), 0);
+  s_glowArc = lv_arc_create(screen);
+  lv_obj_set_size(s_glowArc, 220, 220);
+  lv_obj_align(s_glowArc, LV_ALIGN_CENTER, 0, -10);
+  lv_arc_set_rotation(s_glowArc, 120);
+  lv_arc_set_bg_angles(s_glowArc, 0, 300);
+  lv_arc_set_range(s_glowArc, 0, static_cast<int16_t>(GAUGE_MAX_MBPS));
+  lv_arc_set_value(s_glowArc, 0);
+  lv_arc_set_mode(s_glowArc, LV_ARC_MODE_NORMAL);
+  lv_obj_remove_style(s_glowArc, nullptr, LV_PART_KNOB);
+  lv_obj_clear_flag(s_glowArc, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_arc_width(s_glowArc, 14, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(s_glowArc, lv_color_hex(0x23b9ff), LV_PART_INDICATOR);
+  lv_obj_set_style_arc_width(s_glowArc, 14, LV_PART_MAIN);
+  lv_obj_set_style_arc_opa(s_glowArc, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_move_background(s_glowArc);
+
+  s_speedMeter = lv_meter_create(screen);
+  lv_obj_set_size(s_speedMeter, 210, 210);
+  lv_obj_align(s_speedMeter, LV_ALIGN_CENTER, 0, -10);
+  lv_obj_remove_style(s_speedMeter, nullptr, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_opa(s_speedMeter, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(s_speedMeter, 0, 0);
+
+  s_speedScale = lv_meter_add_scale(s_speedMeter);
+  lv_meter_set_scale_ticks(s_speedMeter, s_speedScale, GAUGE_TICK_COUNT + 1, 1, 12, lv_color_hex(0x074a3a));
+  lv_meter_set_scale_major_ticks(s_speedMeter, s_speedScale, 15, 2, 20, lv_color_hex(0x7EFF8C), 0);
+  lv_meter_set_scale_range(s_speedMeter, s_speedScale, 0, static_cast<int16_t>(GAUGE_MAX_MBPS), 300, 120);
+  lv_obj_set_style_text_font(s_speedMeter, &lv_font_montserrat_12, LV_PART_TICKS);
+  lv_obj_set_style_text_color(s_speedMeter, lv_color_hex(0xbfd2ff), LV_PART_TICKS);
+  lv_obj_set_style_text_opa(s_speedMeter, LV_OPA_TRANSP, LV_PART_TICKS);
+
+  s_speedNeedle = lv_meter_add_needle_line(s_speedMeter, s_speedScale, 4, lv_color_hex(0xffa14a), -14);
+  lv_obj_set_style_line_rounded(s_speedMeter, true, LV_PART_INDICATOR);
+
+  lv_obj_t *centerCircle = lv_obj_create(screen);
+  lv_obj_set_size(centerCircle, 130, 130);
+  lv_obj_align(centerCircle, LV_ALIGN_CENTER, 0, -10);
+  lv_obj_set_style_bg_color(centerCircle, lv_color_hex(0x050b17), 0);
+  lv_obj_set_style_bg_opa(centerCircle, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(centerCircle, 2, 0);
+  lv_obj_set_style_border_color(centerCircle, lv_color_hex(0x1e2c46), 0);
+  lv_obj_set_style_radius(centerCircle, LV_RADIUS_CIRCLE, 0);
 
   s_downloadLabel = lv_label_create(screen);
   lv_label_set_text(s_downloadLabel, "--");
-  lv_obj_align(s_downloadLabel, LV_ALIGN_TOP_MID, 0, 42);
-  lv_obj_set_style_text_font(s_downloadLabel, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(s_downloadLabel, lv_color_hex(0x7BC6FF), 0);
+  lv_obj_set_style_text_font(s_downloadLabel, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(s_downloadLabel, lv_color_hex(0xE5F5FF), 0);
+  lv_obj_align(s_downloadLabel, LV_ALIGN_CENTER, 0, -20);
 
-  s_chart = lv_chart_create(screen);
-  lv_obj_set_size(s_chart, 280, 150);
-  lv_obj_align(s_chart, LV_ALIGN_BOTTOM_MID, 0, 0);
-  lv_chart_set_type(s_chart, LV_CHART_TYPE_LINE);
-  lv_chart_set_point_count(s_chart, RATE_HISTORY_SAMPLES);
-  lv_chart_set_update_mode(s_chart, LV_CHART_UPDATE_MODE_SHIFT);
-  lv_chart_set_div_line_count(s_chart, 0, 0);
-  lv_chart_set_range(s_chart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
-  lv_obj_set_style_bg_opa(s_chart, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(s_chart, 0, 0);
-  lv_obj_set_style_pad_all(s_chart, 0, 0);
-  lv_obj_set_style_radius(s_chart, 0, 0);
-  lv_obj_add_flag(s_chart, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
-  lv_chart_set_axis_tick(s_chart, LV_CHART_AXIS_PRIMARY_X, 0, 0, 0, 0, true, 0);
-  lv_chart_set_axis_tick(s_chart, LV_CHART_AXIS_PRIMARY_Y, 0, 0, 0, 0, true, 0);
-  lv_obj_set_style_line_width(s_chart, 2, LV_PART_ITEMS);
-  lv_obj_set_style_line_rounded(s_chart, true, LV_PART_ITEMS);
-  lv_obj_set_style_size(s_chart, 0, LV_PART_INDICATOR);
-  lv_obj_add_event_cb(s_chart, chartAreaFillEvent, LV_EVENT_DRAW_PART_BEGIN, nullptr);
+  s_downloadUnitLabel = lv_label_create(screen);
+  lv_label_set_text(s_downloadUnitLabel, "Mbps");
+  lv_obj_set_style_text_font(s_downloadUnitLabel, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(s_downloadUnitLabel, lv_color_hex(0x82b1ff), 0);
+  lv_obj_align_to(s_downloadUnitLabel, s_downloadLabel, LV_ALIGN_OUT_BOTTOM_MID, 0, 4);
 
-  s_downSeries = lv_chart_add_series(s_chart, lv_color_hex(0x7BC6FF), LV_CHART_AXIS_PRIMARY_Y);
-  s_upSeries = lv_chart_add_series(s_chart, lv_color_hex(0xFFB483), LV_CHART_AXIS_PRIMARY_Y);
-  lv_chart_set_all_value(s_chart, s_downSeries, 0);
-  lv_chart_set_all_value(s_chart, s_upSeries, 0);
+  s_uploadLabel = lv_label_create(screen);
+  lv_label_set_text(s_uploadLabel, LV_SYMBOL_UPLOAD " --");
+  lv_obj_set_style_text_font(s_uploadLabel, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(s_uploadLabel, lv_color_hex(0xFFB86C), 0);
+  lv_obj_align(s_uploadLabel, LV_ALIGN_BOTTOM_MID, 0, -16);
 
-  resetRateHistory();
+  s_displayedDownloadMbps = 0.0f;
 }
 
 // --- Setup & loop -----------------------------------------------------------
