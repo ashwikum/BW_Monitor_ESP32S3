@@ -1,0 +1,22 @@
+# Arduino/PlatformIO build files
+build/
+*.bin
+*.elf
+*.hex
+*.map
+*.pio
+/.vs/
+.vscode/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Temporary / editor
+*.tmp
+*.log
+
+# OneDrive cache
+~$*

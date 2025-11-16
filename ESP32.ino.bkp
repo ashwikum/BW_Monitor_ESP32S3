@@ -1,0 +1,416 @@
+#include <Arduino.h>
+#include "LCD_Test.h" // Assuming this contains Paint_xxx and LCD_xxx functions
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <math.h> // For pow() function
+
+// BLE related includes
+#include <BLEUtils.h>
+#include <BLEAdvertisedDevice.h>
+#include <BLEDevice.h>
+#include <BLEScan.h>
+
+// Forward declaration if LCD_Test.h doesn't have them or for clarity
+// extern void Paint_DrawRectangle(UWORD Xstart, UWORD Ystart, UWORD Xend, UWORD Yend, UWORD Color, DOT_PIXEL Line_width, DRAW_FILL Draw_Fill);
+// extern void Paint_DrawString_EN(UWORD Xstart, UWORD Ystart, const char * pString, sFONT* Font, UWORD Color_Foreground, UWORD Color_Background);
+// extern void LCD_1IN28_Display(UWORD *Image);
+// extern sFONT Font16; // Assuming Font16 is defined in fonts.h, which is included by GUI_Paint.h
+// extern UWORD RED, WHITE, BLACK, BLUE, GREEN; // Assuming these color constants are defined in GUI_Paint.h
+
+UWORD Imagesize = LCD_1IN28_HEIGHT * LCD_1IN28_WIDTH * 2;
+UWORD *BlackImage = NULL; 
+
+// BLE Scan pointer
+BLEScan *pBLEScan;
+
+// Sensor MAC Addresses - MUST BE DEFINED BEFORE tyreMonitors
+BLEAddress SensorId1("74:B8:39:2B:14:53"); // Front Left Sensor
+BLEAddress SensorId2("74:B8:39:2B:14:3D"); // Front Right Sensor
+BLEAddress SensorId3("74:B8:39:2B:0B:7F"); // Rear Left Sensor
+BLEAddress SensorId4("74:B8:39:2B:11:AE"); // Rear Right Sensor
+BLEAddress SensorId5("74:B8:39:2B:14:15"); // Spare Sensor
+
+// --- Constants for Pressure Calculation ---
+const float LOCAL_ATMOSPHERIC_PRESSURE_PSI = 13.38f; 
+
+// --- Activity Indicator ---
+const char activityChars[] = {'-', '\\', '|', '/'};
+int activityCharIndex = 0;
+unsigned long lastActivityUpdate = 0;
+const int activityIndicatorY = 220; // Y position for the activity indicator (near bottom)
+
+
+// Structure to hold data for each tyre
+struct TyreInfo {
+  const char* name;
+  BLEAddress address; // BLEAddress member
+  float temperature_c;
+  float gauge_pressure_psi;
+  bool dataValid; 
+  unsigned long lastUpdateTime; 
+  char payloadTypeStr[10]; // To store "Type: 1" or "Type: 2"
+
+  // Constructor to initialize all members
+  TyreInfo(const char* n, const BLEAddress& addr, float temp, float psi, bool valid, unsigned long time, const char* type)
+    : name(n), address(addr), temperature_c(temp), gauge_pressure_psi(psi), dataValid(valid), lastUpdateTime(time) {
+      strncpy(payloadTypeStr, type, sizeof(payloadTypeStr) - 1);
+      payloadTypeStr[sizeof(payloadTypeStr) - 1] = '\0'; // Ensure null termination
+    }
+
+  // Default constructor: Initializes BLEAddress with a dummy valid string.
+  TyreInfo() 
+    : name("N/A"), address(BLEAddress("00:00:00:00:00:00")), temperature_c(-999.0f), gauge_pressure_psi(-999.0f), dataValid(false), lastUpdateTime(0) {
+    strcpy(payloadTypeStr, "N/A");
+  }
+};
+
+// Array to store data for the 4 main tyres + 1 spare
+// Initialize it globally using the constructor
+TyreInfo tyreMonitors[5] = {
+  TyreInfo("FL", SensorId1, -999.0f, -999.0f, false, 0, "N/A"),
+  TyreInfo("FR", SensorId2, -999.0f, -999.0f, false, 0, "N/A"),
+  TyreInfo("RL", SensorId3, -999.0f, -999.0f, false, 0, "N/A"),
+  TyreInfo("RR", SensorId4, -999.0f, -999.0f, false, 0, "N/A"),
+  TyreInfo("Spare", SensorId5, -999.0f, -999.0f, false, 0, "N/A")
+};
+
+
+// Function to get tyre name string by BLEAddress (no changes needed here)
+const char* getTyreName(BLEAddress addr) {
+    for (int i = 0; i < 5; ++i) {
+        if (tyreMonitors[i].address.equals(addr)) {
+            return tyreMonitors[i].name;
+        }
+    }
+    return "Unknown";
+}
+
+// Function to update the LCD with all tyre data
+void updateLcdDisplay() {
+    Paint_Clear(BLACK); 
+
+    UWORD desiredTextColor = WHITE;
+    UWORD desiredBackgroundColor = BLACK; 
+
+    int charHeight = (Font16.Height != 0) ? Font16.Height : 16; 
+    int lineSpacing = charHeight + 2; 
+
+    int titleY = 10; 
+    int nameY_row1 = titleY + lineSpacing + 5; 
+    int tempY_row1 = nameY_row1 + lineSpacing; 
+    int presY_row1 = tempY_row1 + lineSpacing;
+    int ageY_row1  = presY_row1 + lineSpacing;
+
+    int nameY_row2 = ageY_row1 + lineSpacing + 8; 
+    int tempY_row2 = nameY_row2 + lineSpacing;
+    int presY_row2 = tempY_row2 + lineSpacing;
+    int ageY_row2  = presY_row2 + lineSpacing;
+
+
+    int col1X_name = 25; 
+    int col1X_data = 20; 
+
+    int col2X_name = 130; 
+    int col2X_data = 125; 
+
+
+    int titleWidthChars = strlen("TPMS Monitor");
+    int charWidth = (Font16.Width != 0) ? Font16.Width : 8; 
+    int titlePixelWidth = titleWidthChars * charWidth;
+    Paint_DrawString_EN((240 - titlePixelWidth) / 2, titleY, "TPMS Monitor", &Font16, desiredBackgroundColor, desiredTextColor);
+
+    char displayTempStr[25]; 
+    char displayPresStr[25]; 
+    char displayAgeStr[25];
+    char numericValStr[10];  
+
+    unsigned long currentTime = millis();
+
+    // Tyre 0 (Front Left)
+    Paint_DrawString_EN(col1X_name, nameY_row1, tyreMonitors[0].name, &Font16, desiredBackgroundColor, desiredTextColor);
+    if (tyreMonitors[0].dataValid) {
+        dtostrf(tyreMonitors[0].temperature_c, 4, 1, numericValStr);
+        sprintf(displayTempStr, "T: %sC", numericValStr);
+        dtostrf(tyreMonitors[0].gauge_pressure_psi, 4, 1, numericValStr);
+        sprintf(displayPresStr, "P: %sPSI", numericValStr);
+        unsigned long ageSeconds = (currentTime - tyreMonitors[0].lastUpdateTime) / 1000;
+        sprintf(displayAgeStr, "Upd: %lus", ageSeconds);
+        Paint_DrawString_EN(col1X_data, tempY_row1, displayTempStr, &Font16, desiredBackgroundColor, desiredTextColor);
+        Paint_DrawString_EN(col1X_data, presY_row1, displayPresStr, &Font16, desiredBackgroundColor, desiredTextColor);
+        Paint_DrawString_EN(col1X_data, ageY_row1, displayAgeStr, &Font16, desiredBackgroundColor, desiredTextColor);
+    } else {
+        Paint_DrawString_EN(col1X_data, tempY_row1, "T: --- C", &Font16, desiredBackgroundColor, desiredTextColor);
+        Paint_DrawString_EN(col1X_data, presY_row1, "P: --- PSI", &Font16, desiredBackgroundColor, desiredTextColor);
+        Paint_DrawString_EN(col1X_data, ageY_row1, "Upd: ---s", &Font16, desiredBackgroundColor, desiredTextColor);
+    }
+
+    // Tyre 1 (Front Right)
+    Paint_DrawString_EN(col2X_name, nameY_row1, tyreMonitors[1].name, &Font16, desiredBackgroundColor, desiredTextColor);
+    if (tyreMonitors[1].dataValid) {
+        dtostrf(tyreMonitors[1].temperature_c, 4, 1, numericValStr);
+        sprintf(displayTempStr, "T: %sC", numericValStr);
+        dtostrf(tyreMonitors[1].gauge_pressure_psi, 4, 1, numericValStr);
+        sprintf(displayPresStr, "P: %sPSI", numericValStr);
+        unsigned long ageSeconds = (currentTime - tyreMonitors[1].lastUpdateTime) / 1000;
+        sprintf(displayAgeStr, "Upd: %lus", ageSeconds);
+        Paint_DrawString_EN(col2X_data, tempY_row1, displayTempStr, &Font16, desiredBackgroundColor, desiredTextColor);
+        Paint_DrawString_EN(col2X_data, presY_row1, displayPresStr, &Font16, desiredBackgroundColor, desiredTextColor);
+        Paint_DrawString_EN(col2X_data, ageY_row1, displayAgeStr, &Font16, desiredBackgroundColor, desiredTextColor);
+    } else {
+        Paint_DrawString_EN(col2X_data, tempY_row1, "T: --- C", &Font16, desiredBackgroundColor, desiredTextColor);
+        Paint_DrawString_EN(col2X_data, presY_row1, "P: --- PSI", &Font16, desiredBackgroundColor, desiredTextColor);
+        Paint_DrawString_EN(col2X_data, ageY_row1, "Upd: ---s", &Font16, desiredBackgroundColor, desiredTextColor);
+    }
+
+    // Tyre 2 (Rear Left)
+    Paint_DrawString_EN(col1X_name, nameY_row2, tyreMonitors[2].name, &Font16, desiredBackgroundColor, desiredTextColor);
+    if (tyreMonitors[2].dataValid) {
+        dtostrf(tyreMonitors[2].temperature_c, 4, 1, numericValStr);
+        sprintf(displayTempStr, "T: %sC", numericValStr);
+        dtostrf(tyreMonitors[2].gauge_pressure_psi, 4, 1, numericValStr);
+        sprintf(displayPresStr, "P: %sPSI", numericValStr);
+        unsigned long ageSeconds = (currentTime - tyreMonitors[2].lastUpdateTime) / 1000;
+        sprintf(displayAgeStr, "Upd: %lus", ageSeconds);
+        Paint_DrawString_EN(col1X_data, tempY_row2, displayTempStr, &Font16, desiredBackgroundColor, desiredTextColor);
+        Paint_DrawString_EN(col1X_data, presY_row2, displayPresStr, &Font16, desiredBackgroundColor, desiredTextColor);
+        Paint_DrawString_EN(col1X_data, ageY_row2, displayAgeStr, &Font16, desiredBackgroundColor, desiredTextColor);
+    } else {
+        Paint_DrawString_EN(col1X_data, tempY_row2, "T: --- C", &Font16, desiredBackgroundColor, desiredTextColor);
+        Paint_DrawString_EN(col1X_data, presY_row2, "P: --- PSI", &Font16, desiredBackgroundColor, desiredTextColor);
+        Paint_DrawString_EN(col1X_data, ageY_row2, "Upd: ---s", &Font16, desiredBackgroundColor, desiredTextColor);
+    }
+
+    // Tyre 3 (Rear Right)
+    Paint_DrawString_EN(col2X_name, nameY_row2, tyreMonitors[3].name, &Font16, desiredBackgroundColor, desiredTextColor);
+    if (tyreMonitors[3].dataValid) {
+        dtostrf(tyreMonitors[3].temperature_c, 4, 1, numericValStr);
+        sprintf(displayTempStr, "T: %sC", numericValStr);
+        dtostrf(tyreMonitors[3].gauge_pressure_psi, 4, 1, numericValStr);
+        sprintf(displayPresStr, "P: %sPSI", numericValStr);
+        unsigned long ageSeconds = (currentTime - tyreMonitors[3].lastUpdateTime) / 1000;
+        sprintf(displayAgeStr, "Upd: %lus", ageSeconds);
+        Paint_DrawString_EN(col2X_data, tempY_row2, displayTempStr, &Font16, desiredBackgroundColor, desiredTextColor);
+        Paint_DrawString_EN(col2X_data, presY_row2, displayPresStr, &Font16, desiredBackgroundColor, desiredTextColor);
+        Paint_DrawString_EN(col2X_data, ageY_row2, displayAgeStr, &Font16, desiredBackgroundColor, desiredTextColor);
+    } else {
+        Paint_DrawString_EN(col2X_data, tempY_row2, "T: --- C", &Font16, desiredBackgroundColor, desiredTextColor);
+        Paint_DrawString_EN(col2X_data, presY_row2, "P: --- PSI", &Font16, desiredBackgroundColor, desiredTextColor);
+        Paint_DrawString_EN(col2X_data, ageY_row2, "Upd: ---s", &Font16, desiredBackgroundColor, desiredTextColor);
+    }
+    
+    // Draw Activity Indicator
+    char activityStr[2] = {activityChars[activityCharIndex], '\0'};
+    int activityCharWidth = (Font16.Width != 0) ? Font16.Width : 8;
+    int activityX = (LCD_1IN28_WIDTH - activityCharWidth) / 2; // Centered
+    Paint_DrawString_EN(activityX, activityIndicatorY, activityStr, &Font16, desiredBackgroundColor, desiredTextColor);
+
+    LCD_1IN28_Display(BlackImage);
+}
+
+
+class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks
+{
+  void onResult(BLEAdvertisedDevice device)
+  {
+    BLEAddress advertisedAddress = device.getAddress();
+    int tyreIndex = -1; 
+
+    for (int i = 0; i < 5; ++i) { 
+        if (tyreMonitors[i].address.equals(advertisedAddress)) {
+            tyreIndex = i;
+            break;
+        }
+    }
+
+    if (tyreIndex == -1) { 
+        return; 
+    }
+
+    const char* currentTyreName = tyreMonitors[tyreIndex].name;
+    const uint8_t* payload = device.getPayload();
+    int payloadLen = device.getPayloadLength();
+
+    // --- Start of Enhanced Serial Logging for Calibration ---
+    Serial.println("**************************************");
+    Serial.print("Tyre: "); Serial.println(currentTyreName);
+    Serial.print("Timestamp (ms): "); Serial.println(millis());
+    Serial.print("MAC: "); Serial.println(device.getAddress().toString().c_str());
+    Serial.print("Payload Length: "); Serial.println(payloadLen);
+    Serial.print("Payload Data (Hex): ");
+    for (int i = 0; i < payloadLen; ++i) {
+      Serial.printf("%02X", payload[i]);
+      if (i < payloadLen - 1) Serial.print(" ");
+    }
+    Serial.println();
+    // --- End of Basic Payload Info ---
+
+    float temperature_c = -999.0; 
+    float absolute_pressure_psi = -999.0; // Using single-byte method
+    float gauge_pressure_psi = -999.0f;
+    uint8_t raw_temp_byte = 0;
+    uint8_t raw_pressure_byte_val = 0; 
+    char currentPayloadTypeStr[10] = "N/A";
+
+    if (tyreIndex == 4) { 
+      Serial.println("Info: Spare sensor data.");
+    }
+    
+    // Single-byte pressure calculation with refined factors
+    if (payloadLen >= 29 && payload[0] == 0x02 && payload[1] == 0x01 && payload[2] == 0x06 && payload[3] == 0x11 && payload[4] == 0x06) { // Type 1
+      strcpy(currentPayloadTypeStr, "Type: 1");
+      Serial.print("Payload Type: "); Serial.println(currentPayloadTypeStr);
+      
+      raw_temp_byte = payload[27];
+      temperature_c = (float)raw_temp_byte; 
+      raw_pressure_byte_val = payload[28]; // Single byte for pressure
+      
+      if (raw_pressure_byte_val == 0xA1) { 
+        absolute_pressure_psi = (float)raw_pressure_byte_val * 0.2796f; // Refined factor for 0xA1
+      } else if (raw_pressure_byte_val == 0x91) {
+        absolute_pressure_psi = (float)raw_pressure_byte_val * 0.2657f; // Factor for 0x91
+      } else {
+        Serial.print("Warning: Type 1 - UNCALIBRATED pressure byte: 0x"); Serial.println(raw_pressure_byte_val, HEX);
+        absolute_pressure_psi = (float)raw_pressure_byte_val * 0.2796f; // Generic fallback (e.g., use 0xA1 factor)
+      }
+    }
+    else if (payloadLen == 30 && payload[0] == 0x02 && payload[1] == 0x01 && payload[2] == 0x04 && payload[3] == 0x1A && payload[4] == 0xFF) { // Type 2
+      strcpy(currentPayloadTypeStr, "Type: 2");
+      Serial.print("Payload Type: "); Serial.println(currentPayloadTypeStr);
+
+      raw_temp_byte = payload[payloadLen - 3]; // payload[27]
+      temperature_c = (float)raw_temp_byte; 
+      raw_pressure_byte_val = payload[payloadLen - 2]; // payload[28] - Single byte for pressure
+      
+      if (raw_pressure_byte_val == 0xA1) { 
+        absolute_pressure_psi = (float)raw_pressure_byte_val * 0.2796f; // Refined factor for 0xA1
+      } else if (raw_pressure_byte_val == 0x91) { 
+        absolute_pressure_psi = (float)raw_pressure_byte_val * 0.2657f; // Factor for 0x91
+      } else {
+        Serial.print("Warning: Type 2 - UNCALIBRATED pressure byte: 0x"); Serial.println(raw_pressure_byte_val, HEX);
+        absolute_pressure_psi = (float)raw_pressure_byte_val * 0.2796f; // Generic fallback
+      }
+    } else {
+      Serial.println("Error: Payload type not recognized for detailed TPMS decoding.");
+      if (payloadLen > 0) {
+          Serial.print("Unknown Type - Full Payload (Hex): ");
+          for (int i = 0; i < payloadLen; ++i) { Serial.printf("%02X ", payload[i]); }
+          Serial.println();
+      }
+      Serial.println("**************************************");
+      // Don't update tyre data if payload is unrecognized, but still update LCD to show activity indicator change
+      // updateLcdDisplay(); // This will be called from loop during delay
+      return; 
+    }
+
+    // Calculate Gauge Pressure
+    if (absolute_pressure_psi > -900.0) { 
+        gauge_pressure_psi = absolute_pressure_psi - LOCAL_ATMOSPHERIC_PRESSURE_PSI;
+    }
+
+    // --- Detailed Serial Log for Calibration ---
+    Serial.println("--- Decoded Data (Single Byte Pressure Method - Refined) ---");
+    Serial.print("Raw Temp Byte: 0x"); Serial.print(raw_temp_byte, HEX); Serial.print(" ("); Serial.print(raw_temp_byte); Serial.println(")");
+    Serial.print("Calc Temp: "); Serial.print(temperature_c, 1); Serial.println(" C");
+
+    Serial.print("Raw Pres Byte (used): 0x"); Serial.print(raw_pressure_byte_val, HEX); Serial.print(" ("); Serial.print(raw_pressure_byte_val); Serial.println(")");
+    Serial.print("Calc Abs Pres (from single byte): "); 
+    if (absolute_pressure_psi > -900.0) { Serial.print(absolute_pressure_psi, 2); Serial.println(" PSI"); } else { Serial.println("N/A"); }
+    Serial.print("Calc Gauge Pres (ESP32): "); 
+    if (gauge_pressure_psi > -900.0) { Serial.print(gauge_pressure_psi, 2); Serial.println(" PSI"); } else { Serial.println("N/A"); }
+    Serial.println("ACTION: Note App PSI & Temp now!");
+    Serial.println("**************************************");
+    // --- End of Detailed Serial Log ---
+
+
+    // Update the stored data for the specific tyre
+    bool currentDataIsGood = false;
+    if (temperature_c > -900.0 && gauge_pressure_psi > -900.0) { 
+        tyreMonitors[tyreIndex].temperature_c = temperature_c;
+        tyreMonitors[tyreIndex].gauge_pressure_psi = gauge_pressure_psi; 
+        currentDataIsGood = true;
+    }
+    
+    tyreMonitors[tyreIndex].lastUpdateTime = millis(); 
+    if (tyreIndex < 4) { 
+        tyreMonitors[tyreIndex].dataValid = currentDataIsGood;
+    } else { 
+        tyreMonitors[tyreIndex].dataValid = currentDataIsGood; 
+    }
+    strcpy(tyreMonitors[tyreIndex].payloadTypeStr, currentPayloadTypeStr);
+    
+    // updateLcdDisplay(); // Display update will now be handled by the loop during the delay period
+                         // or immediately if a packet comes in during the delay period's update cycle.
+  }
+};
+
+void setup()
+{
+    Serial.begin(115200);
+    Serial.println("ESP32 TPMS Monitor Starting (V16 - Activity Indicator)...");
+    Serial.print("Local Atmospheric Pressure for Correction: ");
+    Serial.print(LOCAL_ATMOSPHERIC_PRESSURE_PSI, 2);
+    Serial.println(" PSI");
+
+    if(psramInit()){ 
+      Serial.println("\nPSRAM is correctly initialized");
+    }else{
+      Serial.println("PSRAM not available or init failed");
+    }
+
+    Imagesize = LCD_1IN28_HEIGHT * LCD_1IN28_WIDTH * 2; 
+    if (BlackImage == NULL) { 
+        BlackImage = (UWORD *)ps_malloc(Imagesize);
+    }
+
+    if (BlackImage == NULL){
+        Serial.println("Failed to apply for black memory...");
+        while(1); 
+    }
+
+    if (DEV_Module_Init() != 0) { 
+      Serial.println("GPIO Init Fail!");
+    } else {
+      Serial.println("GPIO Init successful!");
+    }
+    
+    LCD_1IN28_Init(HORIZONTAL); 
+    LCD_1IN28_Clear(WHITE); 
+    
+    Paint_NewImage((UBYTE *)BlackImage, LCD_1IN28.WIDTH, LCD_1IN28.HEIGHT, 0, WHITE); 
+    Paint_SetScale(65); 
+    Paint_SetRotate(ROTATE_0); 
+    
+    updateLcdDisplay(); // Initial display draw
+    lastActivityUpdate = millis(); // Initialize activity update timestamp
+
+    DEV_Delay_ms(1000); 
+
+    BLEDevice::init(""); 
+    pBLEScan = BLEDevice::getScan();
+    pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+    pBLEScan->setActiveScan(true); 
+    pBLEScan->setInterval(100);    
+    pBLEScan->setWindow(99);      
+
+    Serial.println("BLE Scan configured. Starting scan loop...");
+}
+
+void loop()
+{
+  Serial.println("Starting BLE Scan (55 seconds)...");
+  BLEDevice::getScan()->start(55, false); 
+  Serial.println("BLE Scan finished. Animating activity indicator during 5s delay...");
+
+  unsigned long delayPeriodStartTime = millis();
+  while(millis() - delayPeriodStartTime < 5000) { // Loop for the 5-second delay period
+    if (millis() - lastActivityUpdate >= 1000) { // Check if 1 second has passed for activity update
+      activityCharIndex = (activityCharIndex + 1) % (sizeof(activityChars) / sizeof(char));
+      updateLcdDisplay(); // Redraw the entire screen with the new activity char and latest TPMS data
+      lastActivityUpdate = millis();
+      Serial.print("Activity Indicator Updated: "); Serial.println(activityChars[activityCharIndex]);
+    }
+    DEV_Delay_ms(50); // Short delay to prevent busy-waiting and allow loop to cycle
+  }
+  Serial.println("5s delay finished. Next scan cycle.");
+}
+// End of C++ code.

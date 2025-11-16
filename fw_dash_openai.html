@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Network Speed Gauges</title>
+
+  <style>
+    /* Responsive layout for two gauges */
+    body { font-family: sans-serif; text-align: center; margin: 20px; }
+    .gauge-container {
+      display: inline-block;
+      width: 45%;
+      min-width: 250px;           /* minimum width to keep gauges legible */
+      margin: 0 auto 40px auto;   /* center align and spacing below */
+    }
+    @media (max-width: 600px) {
+      .gauge-container {
+        display: block;
+        width: 100%;             /* stack gauges on small screens */
+        margin-bottom: 30px;
+      }
+    }
+
+    /* Status + raw dump */
+    #status { margin: 10px auto 20px; font-size: 0.95rem; color: #333; }
+    #rawWrap { max-width: 1000px; margin: 0 auto; text-align: left; }
+    #rawTitle { font-weight: 600; margin: 8px 0; }
+    #rawData {
+      background: #f6f8fa;
+      border: 1px solid #e1e4e8;
+      border-radius: 6px;
+      padding: 12px;
+      overflow: auto;
+      max-height: 320px;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Gauge containers -->
+  <div id="downloadGauge" class="gauge-container"></div>
+  <div id="uploadGauge" class="gauge-container"></div>
+
+  <div id="controls" style="margin: 6px 0 10px;">
+    <label style="cursor: pointer; user-select:none;">
+      <input type="checkbox" id="simulate" />
+      Simulate data (1s updates)
+    </label>
+    <span style="margin-left:14px;">
+      Chart:
+      <select id="chartSelect" style="min-width: 180px;"></select>
+    </span>
+  </div>
+
+  <div id="status"></div>
+  <div id="rawWrap">
+    <div id="rawTitle">Latest Netdata sample (debug)</div>
+    <pre id="rawData">Waiting for data…</pre>
+  </div>
+
+  <!-- Include JustGage library (UMD build from CDN) -->
+  <script src="https://unpkg.com/justgage@latest/dist/justgage.umd.js"></script>
+
+  <script>
+    // Initialize the two gauges with titles and units (Kbps)
+    const downloadGauge = new JustGage({
+      id: 'downloadGauge',
+      value: 0,
+      min: 0,
+      max: 10000,              // e.g. 10000 Kbps max (adjust as needed for your network)
+      title: 'Download',
+      label: '',               // not using the label field (we'll use symbol for units)
+      symbol: ' Kbps',         // append Kbps to the value display
+      relativeGaugeSize: true, // make it responsive to container size
+      pointer: false,          // no needle pointer, just an arc
+      gaugeWidthScale: 0.8,    // thickness of the gauge arc (optional)
+      levelColors: ['#a9d70b', '#f9c802', '#ff0000'] // green-yellow-red color range
+    });
+    const uploadGauge = new JustGage({
+      id: 'uploadGauge',
+      value: 0,
+      min: 0,
+      max: 10000,
+      title: 'Upload',
+      symbol: ' Kbps',
+      relativeGaugeSize: true,
+      pointer: false,
+      gaugeWidthScale: 0.8,
+      levelColors: ['#a9d70b', '#f9c802', '#ff0000']
+    });
+
+    // State for each gauge to persist max value correctly
+    const gaugeState = {
+      download: { maxKbps: downloadGauge.config.max },
+      upload: { maxKbps: uploadGauge.config.max }
+    };
+
+    // Resolve Netdata API base — you said Netdata is at 192.168.128.1
+    const NETDATA_ORIGIN = 'http://192.168.128.1:19999';
+    let currentChart = 'net.igc3';
+    function apiUrl() { return `${NETDATA_ORIGIN}/api/v1/data?chart=${encodeURIComponent(currentChart)}&after=-1&points=1&format=json`; }
+
+    // DOM helpers
+    const $status = document.getElementById('status');
+    const $raw = document.getElementById('rawData');
+    const $simulate = document.getElementById('simulate');
+    const $chart = document.getElementById('chartSelect');
+    let loop = null;
+    let demoState = { dl: 0, ul: 0 };
+
+    function setStatus(text, isError = false) {
+      const mode = $simulate.checked ? 'Demo' : 'Live';
+      $status.textContent = `[${mode}] ${text}`;
+      $status.style.color = isError ? '#b00020' : '#333';
+    }
+
+    // Safely pick a value from a row by label names
+    function valueByLabels(row, labels, candidates) {
+      if (!Array.isArray(labels) || !Array.isArray(row)) return undefined;
+      for (const name of candidates) {
+        const i = labels.indexOf(name);
+        if (i !== -1 && Number.isFinite(row[i])) return row[i];
+      }
+      return undefined;
+    }
+
+    // Adjust gauge max if we exceed headroom and format units
+    function refreshGauge(g, kbps, state) {
+      const currentMaxKbps = state.maxKbps; // Use our persistent state
+      const baselineMax = 10000; // The default max (10 Mbps)
+
+      let newMaxKbps = currentMaxKbps;
+      // If value is over 90% of current max, increase max by 20%
+      if (kbps > currentMaxKbps * 0.9) {
+        newMaxKbps = Math.ceil(kbps * 1.2);
+      }
+      // If value is less than 40% of max, shrink max, but not below a baseline.
+      else if (kbps < currentMaxKbps * 0.4 && currentMaxKbps > baselineMax) {
+          newMaxKbps = Math.max(baselineMax, Math.ceil(kbps * 1.5));
+      }
+
+      let displayValue, displayMax, displayUnit;
+      let precision;
+
+      // Determine unit based on the CURRENT value for more intuitive display.
+      // Note on units: In networking, prefixes are decimal (powers of 1000),
+      // so 1 Mbps = 1,000 kbps. For data storage, binary prefixes (powers of
+      // 1024) are common, but for transfer rates, 1000 is standard.
+      if (kbps >= 999500) { // If current speed is >= ~1Gbps, use Gbps
+        displayUnit = 'Gbps';
+        displayValue = kbps / 1000000;
+        displayMax = newMaxKbps / 1000000;
+        precision = 2;
+      } else if (kbps >= 999.5) { // If current speed is >= ~1Mbps, use Mbps
+        displayUnit = 'Mbps';
+        displayValue = kbps / 1000;
+        displayMax = newMaxKbps / 1000;
+        precision = 1;
+      } else if (kbps < 1 && kbps > 0) { // If it's less than 1kbps, show in bps
+        displayUnit = 'bps';
+        displayValue = kbps * 1000;
+        displayMax = newMaxKbps * 1000;
+        precision = 0;
+      } else { // Otherwise, default to Kbps
+        displayUnit = 'Kbps';
+        displayValue = kbps;
+        displayMax = newMaxKbps;
+        precision = 0;
+      }
+
+      g.config.symbol = ' ' + displayUnit;
+      state.maxKbps = newMaxKbps; // Update our persistent state for the next tick
+
+      // Refresh the gauge with the value and max, both in the same dynamically chosen unit.
+      // Pass numbers to the library, not strings, to be safe.
+      g.refresh(Number(displayValue.toFixed(precision)), Number(displayMax.toFixed(1)));
+    }
+
+    // Function to fetch data from Netdata and update gauges
+    async function fetchAndUpdate() {
+      try {
+        const response = await fetch(apiUrl(), { cache: 'no-store' });
+        if (!response.ok) {
+          if (response.status === 404) {
+            throw new Error(`Chart not found: ${currentChart} (404)`);
+          }
+          throw new Error(`Network error: ${response.status}`);
+        }
+        const data = await response.json();
+        if (!data.data || data.data.length === 0) {
+          setStatus('No data available from Netdata');
+          return;
+        }
+        // Get the first data row (latest values)
+        const lastRow = data.data[0];
+        const labels = data.labels || [];
+        const units = data.units || '';
+
+        // Try common dimension names first, fall back to indices
+        let recvRaw = valueByLabels(lastRow, labels, ['received', 'in', 'inbound', 'rx']);
+        let sentRaw = valueByLabels(lastRow, labels, ['sent', 'out', 'outbound', 'tx']);
+        if (recvRaw === undefined && lastRow.length > 1) recvRaw = lastRow[1];
+        if (sentRaw === undefined && lastRow.length > 2) sentRaw = lastRow[2];
+
+        // Netdata often reports outbound as negative for stacked charts; use absolute
+        const recvVal = Number(recvRaw) || 0;
+        const sentVal = Math.abs(Number(sentRaw) || 0);
+
+        // The API for system.net provides data in Kbps, but doesn't include the `units` field.
+        // We will assume the data is in Kbps and round it.
+        const downloadKbps = Math.round(recvVal);
+        const uploadKbps = Math.round(sentVal);
+
+        // Update the gauges with new values
+        refreshGauge(downloadGauge, downloadKbps, gaugeState.download);
+        refreshGauge(uploadGauge, uploadKbps, gaugeState.upload);
+
+        // Status + raw debug dump
+        const ts = lastRow && Number.isFinite(lastRow[0]) ? new Date(lastRow[0] * 1000) : new Date();
+        setStatus(`Last update: ${ts.toLocaleTimeString()} — Units: Kbps (assumed) (polled 1s)`);
+        const debug = {
+          chart: data.chart || currentChart,
+          units: 'Kbps (assumed)',
+          update_every: data.update_every,
+          labels,
+          lastRow,
+          mapped: {
+            recvRaw,
+            sentRaw,
+            recvVal_used: recvVal,
+            sentVal_used: sentVal,
+            downloadKbps,
+            uploadKbps
+          }
+        };
+        $raw.textContent = JSON.stringify(debug, null, 2);
+      } catch (err) {
+        console.error("Error fetching data:", err);
+        setStatus(`Fetch error: ${err.message}. Check CORS/network.`, true);
+      }
+    }
+
+    // Demo tick (random but smooth-ish)
+    function randWalk(prev, maxStep, floor = 0, ceil = 100000) {
+      const step = (Math.random() * 2 - 1) * maxStep;
+      const next = Math.max(floor, Math.min(ceil, prev + step));
+      return Math.round(next);
+    }
+    function tickSim() {
+      demoState.dl = randWalk(demoState.dl, 2000, 0, 20000); // up to ~20 Mbps
+      demoState.ul = randWalk(demoState.ul, 800, 0, 8000);   // up to ~8 Mbps
+      refreshGauge(downloadGauge, demoState.dl, gaugeState.download);
+      refreshGauge(uploadGauge, demoState.ul, gaugeState.upload);
+      const now = new Date();
+      setStatus(`Last update: ${now.toLocaleTimeString()} — Units: kilobits/s (simulated, polled 1s)`);
+      const debug = {
+        chart: currentChart,
+        units: 'kilobits/s',
+        update_every: 1,
+        labels: ['time','received','sent'],
+        lastRow: [Math.floor(now.getTime()/1000), demoState.dl, -demoState.ul],
+        mapped: {
+          recvRaw: demoState.dl,
+          sentRaw: -demoState.ul,
+          recvVal_used: demoState.dl,
+          sentVal_used: demoState.ul,
+          downloadKbps: demoState.dl,
+          uploadKbps: demoState.ul
+        }
+      };
+      $raw.textContent = JSON.stringify(debug, null, 2);
+    }
+
+    function startLoop() {
+      if (loop) { clearInterval(loop); loop = null; }
+      if ($simulate.checked) {
+        tickSim();
+        loop = setInterval(tickSim, 1000);
+      } else {
+        fetchAndUpdate();
+        loop = setInterval(fetchAndUpdate, 1000);
+      }
+    }
+
+    $simulate.addEventListener('change', startLoop);
+
+    // Populate chart dropdown from Netdata and keep selection
+    async function loadCharts() {
+      try {
+        const res = await fetch(`${NETDATA_ORIGIN}/api/v1/charts`, { cache: 'no-store' });
+        if (!res.ok) throw new Error(`charts ${res.status}`);
+        const charts = await res.json();
+        const keys = Object.keys(charts).filter(k => k === 'system.net' || k.startsWith('net.'));
+        keys.sort((a,b) => a.localeCompare(b));
+        $chart.innerHTML = '';
+        for (const k of keys) {
+          const opt = document.createElement('option');
+          opt.value = k;
+          opt.textContent = k;
+          $chart.appendChild(opt);
+        }
+        // Restore or default
+        const saved = localStorage.getItem('nd_chart');
+        if (saved && keys.includes(saved)) currentChart = saved;
+        else if (keys.includes('system.net')) currentChart = 'system.net';
+        else if (keys.length) currentChart = keys[0];
+        $chart.value = currentChart;
+        setStatus(`Selected chart: ${currentChart}`);
+      } catch (e) {
+        console.warn('Failed to load charts', e);
+        // Fallback to system.net if charts listing fails
+        currentChart = 'system.net';
+        $chart.innerHTML = '';
+        const opt = document.createElement('option');
+        opt.value = currentChart;
+        opt.textContent = currentChart;
+        $chart.appendChild(opt);
+        $chart.value = currentChart;
+        setStatus(`Using default chart: ${currentChart}`);
+      }
+    }
+
+    $chart.addEventListener('change', () => {
+      currentChart = $chart.value;
+      localStorage.setItem('nd_chart', currentChart);
+      startLoop();
+    });
+
+    // Load chart list, then start in Live mode
+    loadCharts().finally(startLoop);
+  </script>
+
+</body>
+</html>
