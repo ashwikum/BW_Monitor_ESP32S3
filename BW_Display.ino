@@ -1,3 +1,10 @@
+/*
+ * BW_Display.ino
+ * ESP32-S3 based bandwidth gauge for Round LCD.
+ * Pulls Netdata metrics over Wi-Fi and renders a dynamic LVGL dial.
+ * Gauge scale adapts to instantaneous download rate while upload value
+ * is reported numerically. Includes Wi-Fi reconnect and PSRAM usage.
+ */
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -17,19 +24,26 @@ constexpr char WIFI_PASSWORD[] = "4423621021";
 // --- Netdata endpoint (use the provided installation details) ---
 constexpr char NETDATA_HOST[] = "192.168.128.1";
 constexpr uint16_t NETDATA_PORT = 19999;
-constexpr char NETDATA_CHART[] = "system.net";
+constexpr char NETDATA_CHART[] = "net.igc3";
 
 // --- Timing configuration ---
 constexpr uint32_t DATA_REFRESH_INTERVAL_MS = 1000;
 constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 30000;
 constexpr uint32_t WIFI_RETRY_BACKOFF_MS = 5000;
+constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 15000;
 constexpr size_t NETDATA_JSON_CAPACITY = 4096;
 
-// --- Gauge behaviour ---
-constexpr float EASING_FACTOR = 0.18f; // smoothing factor for animation
-constexpr float GAUGE_MAX_MBPS = 1000.0f;
+// --- Gauge behaviour ----------------------------------------------------
+// The gauge handles instantaneous download rates up to 1 Gbps but we
+// switch between four discrete scales so that low speeds remain readable.
+constexpr float EASING_FACTOR = 0.18f; // unused but left for future smoothing
+constexpr float GAUGE_MAX_MBPS = 1000.0f; // absolute upper bound
 constexpr int GAUGE_TICK_COUNT = 60;
-constexpr float NEEDLE_SMOOTHING = 0.1f;
+const float kScaleSteps[] = {10.0f, 25.0f, 100.0f, 1000.0f};
+constexpr size_t kScaleStepCount = sizeof(kScaleSteps)/sizeof(kScaleSteps[0]);
+float g_currentScaleMax = kScaleSteps[kScaleStepCount - 1];
+size_t g_currentScaleIndex = kScaleStepCount - 1;
+constexpr float NEEDLE_SMOOTHING = 1.0f; // 1.0 == disabled; needle snaps instantly
 
 // --- LVGL display configuration ---
 constexpr uint16_t SCREEN_WIDTH = 240;
@@ -43,6 +57,7 @@ static lv_color_t *s_lvglPrimaryBuffer = nullptr;
 static TFT_eSPI s_tft = TFT_eSPI(SCREEN_WIDTH, SCREEN_HEIGHT);
 static bool s_lvglInitialized = false;
 static lv_obj_t *s_downloadLabel = nullptr;
+static lv_obj_t *s_scaleLabel = nullptr;
 static lv_obj_t *s_downloadUnitLabel = nullptr;
 static lv_obj_t *s_uploadLabel = nullptr;
 static lv_obj_t *s_speedMeter = nullptr;
@@ -51,6 +66,7 @@ static lv_meter_indicator_t *s_speedNeedle = nullptr;
 static float s_displayedDownloadMbps = 0.0f;
 static lv_obj_t *s_glowArc = nullptr;
 
+// Track instantaneous Netdata values for later animation / logging.
 struct RateState
 {
   float target = 0.0f;
@@ -61,6 +77,7 @@ RateState upRate;
 RateState downRate;
 unsigned long lastDrawLogMillis = 0;
 bool wifiDriverInitialized = false;
+unsigned long g_lastWifiReconnectAttempt = 0;
 
 unsigned long lastDataFetchMillis = 0;
 unsigned long lastUpdateMillis = 0;
@@ -324,6 +341,21 @@ int findLabelIndex(JsonArrayConst labels, const char *const *candidates, size_t 
   return -1;
 }
 
+// Dynamically expand or reduce the gauge range so the dial always shows
+// useful resolution for the current speed. We hysteresis around 50% to avoid
+// oscillation between adjacent ranges.
+void AdjustScaleForSample(float mbps)
+{
+  while (g_currentScaleIndex + 1 < kScaleStepCount && mbps > kScaleSteps[g_currentScaleIndex] * 0.5f)
+  {
+    g_currentScaleIndex++;
+  }
+  while (g_currentScaleIndex > 0 && mbps < kScaleSteps[g_currentScaleIndex - 1] * 0.5f)
+  {
+    g_currentScaleIndex--;
+  }
+  g_currentScaleMax = kScaleSteps[g_currentScaleIndex];
+}
 float readRowValue(JsonArrayConst row, size_t index)
 {
   if (row.isNull() || index >= row.size())
@@ -514,7 +546,7 @@ bool initLvgl()
   lv_disp_draw_buf_init(&s_lvglDrawBuffer, s_lvglPrimaryBuffer, nullptr, LVGL_BUFFER_PIXELS);
 
   s_tft.begin();
-  s_tft.setRotation(2); // flip vertically
+  s_tft.setRotation(0); // flip vertically
 
   lv_disp_drv_init(&s_lvglDisplayDriver);
   s_lvglDisplayDriver.hor_res = SCREEN_WIDTH;
@@ -558,6 +590,8 @@ void formatMbps(char *buffer, size_t length, float mbps, bool includeUnits)
   }
 }
 
+// Blend between blue and green for the glow arc so that higher speeds
+// appear warmer and more intense.
 lv_color_t gaugeColorForRatio(float ratio)
 {
   ratio = clampFloat(ratio, 0.0f, 1.0f);
@@ -575,21 +609,22 @@ void updateRateLabels(float downloadBps, float uploadBps)
   float targetDownloadMbps = clampFloat(downloadBps / 1000000.0f, 0.0f, GAUGE_MAX_MBPS);
   float uploadMbps = clampFloat(uploadBps / 1000000.0f, 0.0f, GAUGE_MAX_MBPS);
 
-  if (NEEDLE_SMOOTHING >= 1.0f) {
-    s_displayedDownloadMbps = targetDownloadMbps;
-  } else {
-    s_displayedDownloadMbps += (targetDownloadMbps - s_displayedDownloadMbps) * NEEDLE_SMOOTHING;
-  }
-  float downloadNeedle = s_displayedDownloadMbps;
+  s_displayedDownloadMbps = targetDownloadMbps;
+  AdjustScaleForSample(targetDownloadMbps);
+  // Needle uses the adaptive scale while the numeric readout shows the
+  // unscaled Mbps value so the user always sees the exact speed.
+  float downloadNeedle = clampFloat(s_displayedDownloadMbps, 0.0f, g_currentScaleMax);
 
   if (s_speedMeter && s_speedNeedle)
   {
+    lv_meter_set_scale_range(s_speedMeter, s_speedScale, 0, static_cast<int16_t>(g_currentScaleMax), 300, 120);
     lv_meter_set_indicator_value(s_speedMeter, s_speedNeedle, static_cast<int32_t>(downloadNeedle));
   }
   if (s_glowArc)
   {
+    lv_arc_set_range(s_glowArc, 0, static_cast<int16_t>(g_currentScaleMax));
     lv_arc_set_value(s_glowArc, static_cast<int16_t>(downloadNeedle));
-    lv_color_t col = gaugeColorForRatio(downloadNeedle / GAUGE_MAX_MBPS);
+    lv_color_t col = gaugeColorForRatio(downloadNeedle / g_currentScaleMax);
     lv_obj_set_style_arc_color(s_glowArc, col, LV_PART_INDICATOR);
   }
 
@@ -598,6 +633,12 @@ void updateRateLabels(float downloadBps, float uploadBps)
     char text[16];
     formatMbps(text, sizeof(text), targetDownloadMbps, false);
     lv_label_set_text(s_downloadLabel, text);
+  }
+  if (s_scaleLabel)
+  {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "0-%.0f", g_currentScaleMax);
+    lv_label_set_text(s_scaleLabel, buf);
   }
   if (s_downloadUnitLabel)
   {
@@ -645,6 +686,7 @@ void createRateScreen()
     return;
   }
 
+  // Build a dark themed dial with a glow arc + LVGL meter for ticks.
   lv_obj_t *screen = lv_scr_act();
   lv_obj_set_style_bg_color(screen, lv_color_hex(0x060b15), 0);
   lv_obj_set_style_bg_grad_color(screen, lv_color_hex(0x0b1224), 0);
@@ -677,7 +719,7 @@ void createRateScreen()
   s_speedScale = lv_meter_add_scale(s_speedMeter);
   lv_meter_set_scale_ticks(s_speedMeter, s_speedScale, GAUGE_TICK_COUNT + 1, 1, 12, lv_color_hex(0x074a3a));
   lv_meter_set_scale_major_ticks(s_speedMeter, s_speedScale, 15, 2, 20, lv_color_hex(0x7EFF8C), 0);
-  lv_meter_set_scale_range(s_speedMeter, s_speedScale, 0, static_cast<int16_t>(GAUGE_MAX_MBPS), 300, 120);
+  lv_meter_set_scale_range(s_speedMeter, s_speedScale, 0, static_cast<int16_t>(g_currentScaleMax), 300, 120);
   lv_obj_set_style_text_font(s_speedMeter, &lv_font_montserrat_12, LV_PART_TICKS);
   lv_obj_set_style_text_color(s_speedMeter, lv_color_hex(0xbfd2ff), LV_PART_TICKS);
   lv_obj_set_style_text_opa(s_speedMeter, LV_OPA_TRANSP, LV_PART_TICKS);
@@ -696,15 +738,23 @@ void createRateScreen()
 
   s_downloadLabel = lv_label_create(screen);
   lv_label_set_text(s_downloadLabel, "--");
-  lv_obj_set_style_text_font(s_downloadLabel, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_font(s_downloadLabel, &lv_font_montserrat_26, 0);
   lv_obj_set_style_text_color(s_downloadLabel, lv_color_hex(0xE5F5FF), 0);
   lv_obj_align(s_downloadLabel, LV_ALIGN_CENTER, 0, -20);
 
   s_downloadUnitLabel = lv_label_create(screen);
   lv_label_set_text(s_downloadUnitLabel, "Mbps");
-  lv_obj_set_style_text_font(s_downloadUnitLabel, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_font(s_downloadUnitLabel, &lv_font_montserrat_16, 0);
   lv_obj_set_style_text_color(s_downloadUnitLabel, lv_color_hex(0x82b1ff), 0);
   lv_obj_align_to(s_downloadUnitLabel, s_downloadLabel, LV_ALIGN_OUT_BOTTOM_MID, 0, 4);
+
+  s_scaleLabel = lv_label_create(screen);
+  lv_label_set_text(s_scaleLabel, "0-1000");
+  lv_obj_set_style_text_font(s_scaleLabel, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(s_scaleLabel, lv_color_hex(0x5e6b96), 0);
+  lv_obj_set_width(s_scaleLabel, 80);
+  lv_obj_align_to(s_scaleLabel, s_downloadUnitLabel, LV_ALIGN_OUT_BOTTOM_MID, 0, 4);
+  lv_obj_set_style_text_align(s_scaleLabel, LV_TEXT_ALIGN_CENTER, 0);
 
   s_uploadLabel = lv_label_create(screen);
   lv_label_set_text(s_uploadLabel, LV_SYMBOL_UPLOAD " --");
@@ -774,6 +824,22 @@ void loop()
     {
       Serial.println("Loop: Wi-Fi disconnected, skipping fetch.");
     }
+  }
+
+  // Keep Wi-Fi alive when Netdata is polling continuously. We retry
+  // every WIFI_RECONNECT_INTERVAL_MS until the module reports WL_CONNECTED.
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    if (now - g_lastWifiReconnectAttempt >= WIFI_RECONNECT_INTERVAL_MS)
+    {
+      g_lastWifiReconnectAttempt = now;
+      Serial.println("Attempting Wi-Fi reconnect...");
+      attemptWifiConnect();
+    }
+  }
+  else
+  {
+    g_lastWifiReconnectAttempt = now;
   }
 
   if (s_lvglInitialized)
