@@ -56,10 +56,11 @@ static lv_disp_drv_t s_lvglDisplayDriver;
 static lv_color_t *s_lvglPrimaryBuffer = nullptr;
 static TFT_eSPI s_tft = TFT_eSPI(SCREEN_WIDTH, SCREEN_HEIGHT);
 static bool s_lvglInitialized = false;
-static lv_obj_t *s_downloadLabel = nullptr;
+static lv_obj_t *s_downloadCenterLabel = nullptr;
+static lv_obj_t *s_uploadCenterLabel = nullptr;
 static lv_obj_t *s_scaleLabel = nullptr;
-static lv_obj_t *s_downloadUnitLabel = nullptr;
-static lv_obj_t *s_uploadLabel = nullptr;
+static lv_obj_t *s_centerDivider = nullptr;
+static lv_point_t s_centerDividerPoints[2] = {{-60, 0}, {60, 0}};
 static lv_obj_t *s_speedMeter = nullptr;
 static lv_meter_scale_t *s_speedScale = nullptr;
 static lv_meter_indicator_t *s_speedNeedle = nullptr;
@@ -628,28 +629,25 @@ void updateRateLabels(float downloadBps, float uploadBps)
     lv_obj_set_style_arc_color(s_glowArc, col, LV_PART_INDICATOR);
   }
 
-  if (s_downloadLabel)
+  if (s_downloadCenterLabel)
   {
-    char text[16];
-    formatMbps(text, sizeof(text), targetDownloadMbps, false);
-    lv_label_set_text(s_downloadLabel, text);
+    char downText[16];
+    formatMbps(downText, sizeof(downText), targetDownloadMbps, false);
+    // lv_label_set_text_fmt(s_downloadCenterLabel, LV_SYMBOL_DOWNLOAD " %s ", downText);
+    lv_label_set_text_fmt(s_downloadCenterLabel, " %s ", downText);
+  }
+  if (s_uploadCenterLabel)
+  {
+    char uploadText[16];
+    formatMbps(uploadText, sizeof(uploadText), uploadMbps, false);
+    // lv_label_set_text_fmt(s_uploadCenterLabel, LV_SYMBOL_UPLOAD " %s ", uploadText);
+    lv_label_set_text_fmt(s_uploadCenterLabel, " %s ", uploadText);
   }
   if (s_scaleLabel)
   {
-    char buf[24];
-    snprintf(buf, sizeof(buf), "0-%.0f", g_currentScaleMax);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "0-%.0f Mbps", g_currentScaleMax);
     lv_label_set_text(s_scaleLabel, buf);
-  }
-  if (s_downloadUnitLabel)
-  {
-    lv_label_set_text(s_downloadUnitLabel, "Mbps");
-  }
-
-  if (s_uploadLabel)
-  {
-    char uploadText[24];
-    formatMbps(uploadText, sizeof(uploadText), uploadMbps, true);
-    lv_label_set_text_fmt(s_uploadLabel, LV_SYMBOL_UPLOAD " %s", uploadText);
   }
 }
 
@@ -659,13 +657,13 @@ void showNetdataError()
   {
     return;
   }
-  if (s_downloadLabel)
+  if (s_downloadCenterLabel)
   {
-    lv_label_set_text(s_downloadLabel, "--");
+    lv_label_set_text(s_downloadCenterLabel, LV_SYMBOL_DOWNLOAD " -- ");
   }
-  if (s_uploadLabel)
+  if (s_uploadCenterLabel)
   {
-    lv_label_set_text(s_uploadLabel, LV_SYMBOL_UPLOAD " --");
+    lv_label_set_text(s_uploadCenterLabel, LV_SYMBOL_UPLOAD " -- ");
   }
   if (s_speedMeter && s_speedNeedle)
   {
@@ -675,6 +673,10 @@ void showNetdataError()
   {
     lv_arc_set_value(s_glowArc, 0);
     lv_obj_set_style_arc_color(s_glowArc, lv_color_hex(0x23b9ff), LV_PART_INDICATOR);
+  }
+  if (s_scaleLabel)
+  {
+    lv_label_set_text(s_scaleLabel, "0-1000 Mbps");
   }
   s_displayedDownloadMbps = 0.0f;
 }
@@ -736,31 +738,31 @@ void createRateScreen()
   lv_obj_set_style_border_color(centerCircle, lv_color_hex(0x1e2c46), 0);
   lv_obj_set_style_radius(centerCircle, LV_RADIUS_CIRCLE, 0);
 
-  s_downloadLabel = lv_label_create(screen);
-  lv_label_set_text(s_downloadLabel, "--");
-  lv_obj_set_style_text_font(s_downloadLabel, &lv_font_montserrat_26, 0);
-  lv_obj_set_style_text_color(s_downloadLabel, lv_color_hex(0xE5F5FF), 0);
-  lv_obj_align(s_downloadLabel, LV_ALIGN_CENTER, 0, -20);
+  s_centerDivider = lv_line_create(screen);
+  lv_line_set_points(s_centerDivider, s_centerDividerPoints, 2);
+  lv_obj_set_style_line_color(s_centerDivider, lv_color_hex(0x1e2c46), 0);
+  lv_obj_set_style_line_width(s_centerDivider, 2, 0);
+  lv_obj_align(s_centerDivider, LV_ALIGN_CENTER, 0, -5); // adjust Y here to move labels
 
-  s_downloadUnitLabel = lv_label_create(screen);
-  lv_label_set_text(s_downloadUnitLabel, "Mbps");
-  lv_obj_set_style_text_font(s_downloadUnitLabel, &lv_font_montserrat_16, 0);
-  lv_obj_set_style_text_color(s_downloadUnitLabel, lv_color_hex(0x82b1ff), 0);
-  lv_obj_align_to(s_downloadUnitLabel, s_downloadLabel, LV_ALIGN_OUT_BOTTOM_MID, 0, 4);
+  s_downloadCenterLabel = lv_label_create(screen);
+  lv_label_set_text(s_downloadCenterLabel, "--");
+  lv_obj_set_style_text_font(s_downloadCenterLabel, &lv_font_montserrat_24, 0);
+  lv_obj_set_style_text_color(s_downloadCenterLabel, lv_color_hex(0xE5F5FF), 0);
+  lv_obj_align(s_downloadCenterLabel, LV_ALIGN_CENTER, 0, -32); // adjust this offset to move the download label vertically
+
+  s_uploadCenterLabel = lv_label_create(screen);
+  lv_label_set_text(s_uploadCenterLabel, "--");
+  lv_obj_set_style_text_font(s_uploadCenterLabel, &lv_font_montserrat_24, 0);
+  lv_obj_set_style_text_color(s_uploadCenterLabel, lv_color_hex(0xFFB86C), 0);
+  lv_obj_align(s_uploadCenterLabel, LV_ALIGN_CENTER, 0, 17); // adjust this offset to move the upload label vertically
 
   s_scaleLabel = lv_label_create(screen);
-  lv_label_set_text(s_scaleLabel, "0-1000");
-  lv_obj_set_style_text_font(s_scaleLabel, &lv_font_montserrat_16, 0);
+  lv_label_set_text(s_scaleLabel, "0-1000 Mbps");
+  lv_obj_set_style_text_font(s_scaleLabel, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(s_scaleLabel, lv_color_hex(0x5e6b96), 0);
-  lv_obj_set_width(s_scaleLabel, 80);
-  lv_obj_align_to(s_scaleLabel, s_downloadUnitLabel, LV_ALIGN_OUT_BOTTOM_MID, 0, 4);
+  lv_obj_set_width(s_scaleLabel, 140);
+  lv_obj_align(s_scaleLabel, LV_ALIGN_BOTTOM_MID, 0, -16);
   lv_obj_set_style_text_align(s_scaleLabel, LV_TEXT_ALIGN_CENTER, 0);
-
-  s_uploadLabel = lv_label_create(screen);
-  lv_label_set_text(s_uploadLabel, LV_SYMBOL_UPLOAD " --");
-  lv_obj_set_style_text_font(s_uploadLabel, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(s_uploadLabel, lv_color_hex(0xFFB86C), 0);
-  lv_obj_align(s_uploadLabel, LV_ALIGN_BOTTOM_MID, 0, -16);
 
   s_displayedDownloadMbps = 0.0f;
 }
